@@ -1,3 +1,7 @@
+-- KAMUS UMUM: 3000+ kata umum Indonesia dengan kategori
+-- Auto-generated — jangan edit manual
+-- Format: words[kata] = kategori
+
 return {
     categories = {"Semua", "Benda", "Hewan", "Makanan", "Negara", "Sifat", "Kerja", "Tempat", "Tubuh", "Alam", "Umum"},
     words = {
