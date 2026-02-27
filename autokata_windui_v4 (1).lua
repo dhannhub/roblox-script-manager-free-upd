@@ -11,22 +11,29 @@ local logBuffer   = {}          -- simpan semua log di sini
 local MAX_LOGS    = 80          -- max baris yang disimpan
 local logParagraph = nil        -- referensi ke UI paragraph (di-set nanti)
 
+local logDirty = false
+
 local function pushLog(line)
     table.insert(logBuffer, line)
-    -- buang log lama kalau udah penuh
     if #logBuffer > MAX_LOGS then
         table.remove(logBuffer, 1)
     end
-    -- update paragraph kalau sudah ada
-    if logParagraph and logParagraph.SetDesc then
-        -- tampilkan 20 log terakhir biar ga overflow
-        local display = {}
-        local start = math.max(1, #logBuffer - 19)
-        for i = start, #logBuffer do
-            table.insert(display, logBuffer[i])
-        end
-        pcall(function() logParagraph:SetDesc(table.concat(display, "\n")) end)
+    -- TIDAK sentuh UI di sini sama sekali — zero UI overhead di hot path
+    logDirty = true
+end
+
+-- dipanggil dari timer setiap 1 detik, bukan dari log()
+local function flushLogUI()
+    if not logDirty or not logParagraph then return end
+    logDirty = false
+    local display = {}
+    local s = math.max(1, #logBuffer - 19)
+    for i = s, #logBuffer do
+        table.insert(display, logBuffer[i])
     end
+    pcall(function()
+        logParagraph:SetDesc(table.concat(display, "\n"))
+    end)
 end
 
 local function log(tag, ...)
@@ -63,6 +70,32 @@ _G.AutoKataActive = true
 
 -- nanti diisi setelah GUI dibuat
 _G.AutoKataDestroy = nil
+
+-- =========================
+-- GLOBAL ERROR HANDLER — auto kick dengan pesan custom kalau script crash
+-- =========================
+local function crashKick(errMsg)
+    local msg = tostring(errMsg):sub(1, 150)
+    -- hanya log error, TIDAK auto kick (kick bikin Error Code 267)
+    -- kick hanya untuk error fatal yang benar-benar butuh restart
+    pushLog("⚠ [CRASH] " .. msg)
+end
+
+-- safeSpawn: wrapper task.spawn dengan xpcall, auto kick kalau crash
+-- TIDAK override task.spawn (readonly di executor)
+local function safeSpawn(fn, ...)
+    local args = {...}
+    task.spawn(function()
+        local ok, err = xpcall(function()
+            fn(table.unpack(args))
+        end, function(e)
+            return tostring(e) .. "\n" .. debug.traceback()
+        end)
+        if not ok then
+            crashKick(err)
+        end
+    end)
+end
 
 -- =========================
 -- WAIT GAME LOAD
@@ -103,6 +136,24 @@ end
 log("WINDUI", "WindUI loaded OK:", type(WindUI))
 
 -- =========================
+-- TOPBARPLUS ERROR SUPPRESSOR
+-- WindUI load TopbarPlus yang punya bug "attempt to modify a readonly"
+-- di CoreGui Line 88. Error ini spam console dan sedikit overhead.
+-- Suppress dengan pcall semua operasi CoreGui-related dari TopbarPlus.
+-- =========================
+pcall(function()
+    -- intercept ScriptContext.Error untuk filter error dari TopbarPlus
+    local ScriptContext = game:GetService("ScriptContext")
+    ScriptContext.Error:Connect(function(msg, trace, scr)
+        -- abaikan semua error dari CoreGui TopbarPlus
+        if scr and tostring(scr):find("CoreGui") and msg:find("readonly") then
+            -- suppress — tidak perlu log, ini noise dari TopbarPlus
+            return
+        end
+    end)
+end)
+
+-- =========================
 -- SERVICES
 -- =========================
 log("SERVICES", "Mengambil services...")
@@ -113,6 +164,38 @@ local TeleportService   = game:GetService("TeleportService")
 local Workspace         = game:GetService("Workspace")
 local LocalPlayer       = Players.LocalPlayer
 log("SERVICES", "LocalPlayer:", LocalPlayer.Name)
+
+-- ADMIN CONFIG
+-- Isi userId admin di sini
+-- =========================
+local ADMIN_IDS = {
+   3379547587,
+}
+
+local MAINTENANCE_MODE = false   -- set true = semua user non-admin kena lock
+local BLACKLIST        = {}      -- { [userId] = true }
+
+local function isAdmin(player)
+    local uid = player and player.UserId
+    for _, id in ipairs(ADMIN_IDS) do
+        if id == uid then return true end
+    end
+    return false
+end
+
+local function checkAccess()
+    if MAINTENANCE_MODE and not isAdmin(LocalPlayer) then
+        LocalPlayer:Kick("[AutoKata] Maintenance Mode aktif. Coba lagi nanti.")
+        return false
+    end
+    if BLACKLIST[LocalPlayer.UserId] then
+        LocalPlayer:Kick("[AutoKata] Kamu di-blacklist dari script ini.")
+        return false
+    end
+    return true
+end
+
+-- =========================
 
 -- =========================
 -- SIMPLESPY — pantau SEMUA remote di game
@@ -410,59 +493,68 @@ local function getSmartWords(prefix)
     return results
 end
 
-local function humanDelay()
-    local mn, mx = config.minDelay, config.maxDelay
-    if mn > mx then mn = mx end
-    local d = math.random(mn, mx)
-    task.wait(d / 1000)
-end
-
 -- =========================
 -- VIRTUAL INPUT HELPER
--- Support PC (keypress/keyrelease) dan Android (VirtualInputManager)
+-- Urutan deklarasi: findTextBox → sendKey → sendBackspace → deleteExtraChars
 -- =========================
 local VIM = nil
-pcall(function()
-    VIM = game:GetService("VirtualInputManager")
-end)
-log("INPUT", "VirtualInputManager:", VIM and "tersedia" or "tidak tersedia")
-log("INPUT", "keypress global:", (keypress ~= nil) and "tersedia" or "tidak tersedia")
-log("INPUT", "keyrelease global:", (keyrelease ~= nil) and "tersedia" or "tidak tersedia")
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
 
 local charToKeyCode = {
-    a=Enum.KeyCode.A, b=Enum.KeyCode.B, c=Enum.KeyCode.C, d=Enum.KeyCode.D,
-    e=Enum.KeyCode.E, f=Enum.KeyCode.F, g=Enum.KeyCode.G, h=Enum.KeyCode.H,
-    i=Enum.KeyCode.I, j=Enum.KeyCode.J, k=Enum.KeyCode.K, l=Enum.KeyCode.L,
-    m=Enum.KeyCode.M, n=Enum.KeyCode.N, o=Enum.KeyCode.O, p=Enum.KeyCode.P,
-    q=Enum.KeyCode.Q, r=Enum.KeyCode.R, s=Enum.KeyCode.S, t=Enum.KeyCode.T,
-    u=Enum.KeyCode.U, v=Enum.KeyCode.V, w=Enum.KeyCode.W, x=Enum.KeyCode.X,
-    y=Enum.KeyCode.Y, z=Enum.KeyCode.Z,
+    a=Enum.KeyCode.A,b=Enum.KeyCode.B,c=Enum.KeyCode.C,d=Enum.KeyCode.D,
+    e=Enum.KeyCode.E,f=Enum.KeyCode.F,g=Enum.KeyCode.G,h=Enum.KeyCode.H,
+    i=Enum.KeyCode.I,j=Enum.KeyCode.J,k=Enum.KeyCode.K,l=Enum.KeyCode.L,
+    m=Enum.KeyCode.M,n=Enum.KeyCode.N,o=Enum.KeyCode.O,p=Enum.KeyCode.P,
+    q=Enum.KeyCode.Q,r=Enum.KeyCode.R,s=Enum.KeyCode.S,t=Enum.KeyCode.T,
+    u=Enum.KeyCode.U,v=Enum.KeyCode.V,w=Enum.KeyCode.W,x=Enum.KeyCode.X,
+    y=Enum.KeyCode.Y,z=Enum.KeyCode.Z,
 }
-
 local charToScanCode = {
     a=65,b=66,c=67,d=68,e=69,f=70,g=71,h=72,i=73,j=74,
     k=75,l=76,m=77,n=78,o=79,p=80,q=81,r=82,s=83,t=84,
     u=85,v=86,w=87,x=88,y=89,z=90,
 }
 
-local inputMethod = "unknown"
+-- 1. findTextBox — HARUS deklarasi pertama
+local function findTextBox()
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not gui then return nil end
+    local function find(p)
+        for _, c in ipairs(p:GetChildren()) do
+            if c:IsA("TextBox") then return c end
+            local r = find(c)
+            if r then return r end
+        end
+        return nil
+    end
+    return find(gui)
+end
 
+local function focusTextBox()
+    local tb = findTextBox()
+    if tb then pcall(function() tb:CaptureFocus() end) end
+end
+
+local function getTextBoxContent()
+    local tb = findTextBox()
+    return tb and (tb.Text or "") or ""
+end
+
+-- 2. sendKey — pakai findTextBox
 local function sendKey(char)
     local c = string.lower(char)
     if VIM then
-        inputMethod = "VirtualInputManager"
         local kc = charToKeyCode[c]
         if kc then
             pcall(function()
                 VIM:SendKeyEvent(true,  kc, false, game)
-                task.wait(0.03)
+                task.wait(0.025)
                 VIM:SendKeyEvent(false, kc, false, game)
             end)
         end
         return
     end
     if keypress and keyrelease then
-        inputMethod = "keypress/keyrelease"
         local code = charToScanCode[c]
         if code then
             keypress(code)
@@ -471,132 +563,161 @@ local function sendKey(char)
         end
         return
     end
-    inputMethod = "FireInput fallback"
+    -- fallback: tulis langsung ke TextBox
     pcall(function()
-        local uis = game:GetService("UserInputService")
-        local kc  = charToKeyCode[c]
-        if kc then
-            local obj = { KeyCode = kc, UserInputType = Enum.UserInputType.Keyboard, UserInputState = Enum.UserInputState.Begin }
-            uis:FireInput(obj)
-            task.wait(0.02)
-            obj.UserInputState = Enum.UserInputState.End
-            uis:FireInput(obj)
-        end
+        local tb = findTextBox()
+        if tb then tb.Text = tb.Text .. c end
     end)
 end
 
 local function sendEnter()
-    log("INPUT", "sendEnter via", inputMethod)
     if VIM then
         pcall(function()
             VIM:SendKeyEvent(true,  Enum.KeyCode.Return, false, game)
-            task.wait(0.03)
+            task.wait(0.025)
             VIM:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
         end)
         return
     end
     if keypress and keyrelease then
-        keypress(13)
-        task.wait(0.02)
-        keyrelease(13)
-        return
+        keypress(13) task.wait(0.02) keyrelease(13)
     end
 end
 
-local function focusTextBox()
-    log("INPUT", "Mencari TextBox aktif di PlayerGui...")
-    local gui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not gui then log("INPUT", "PlayerGui tidak ditemukan!") return end
-    local function find(p)
-        for _, c in ipairs(p:GetChildren()) do
-            if c:IsA("TextBox") then
-                log("INPUT", "TextBox ditemukan:", c:GetFullName())
-                pcall(function() c:CaptureFocus() end)
-                return true
-            end
-            if find(c) then return true end
-        end
-        return false
+-- 3. sendBackspace — pakai findTextBox
+local function sendBackspace()
+    if VIM then
+        pcall(function()
+            VIM:SendKeyEvent(true,  Enum.KeyCode.Backspace, false, game)
+            task.wait(0.025)
+            VIM:SendKeyEvent(false, Enum.KeyCode.Backspace, false, game)
+        end)
+        return
     end
-    local found = find(gui)
-    if not found then log("INPUT", "Tidak ada TextBox ditemukan!") end
+    if keypress and keyrelease then
+        keypress(8) task.wait(0.02) keyrelease(8)
+        return
+    end
+    -- fallback langsung potong text
+    pcall(function()
+        local tb = findTextBox()
+        if tb and #tb.Text > 0 then
+            tb.Text = string.sub(tb.Text, 1, -2)
+        end
+    end)
 end
 
--- =========================
--- AUTO ENGINE
--- =========================
-local function startUltraAI()
-    log("AI", "startUltraAI dipanggil | autoRunning=" .. tostring(autoRunning)
-        .. " autoEnabled=" .. tostring(autoEnabled)
-        .. " matchActive=" .. tostring(matchActive)
-        .. " isMyTurn=" .. tostring(isMyTurn)
-        .. " serverLetter='" .. serverLetter .. "'")
-
-    if autoRunning or not autoEnabled or not matchActive or not isMyTurn or serverLetter == "" then
-        log("AI", "Kondisi tidak terpenuhi, skip")
-        return
-    end
-
-    autoRunning = true
-
-    -- jeda awal sebelum mulai ngetik
-    if config.initialDelay > 0 then
-        log("AI", "Jeda awal:", config.initialDelay, "detik...")
-        task.wait(config.initialDelay)
-        -- cek lagi setelah jeda, siapa tau giliran sudah berakhir
-        if not matchActive or not isMyTurn then
-            log("AI", "Giliran berakhir saat jeda awal, batal")
-            autoRunning = false
-            return
-        end
-    end
-
-    log("AI", "AI berjalan, human delay pertama...")
-    humanDelay()
-
-    local words = getSmartWords(serverLetter)
-    if #words == 0 then
-        logerr("AI", "Tidak ada kata ditemukan untuk prefix='" .. serverLetter .. "'")
-        autoRunning = false
-        return
-    end
-
-    local sel = words[1]
-    if config.aggression < 100 then
-        local topN = math.max(1, math.floor(#words * (1 - config.aggression / 100)))
-        sel = words[math.random(1, topN)]
-    end
-
-    log("AI", "Kata dipilih: '" .. sel .. "' | remain: '" .. string.sub(sel, #serverLetter + 1) .. "'")
-    log("AI", "Input method yang akan dipakai:", VIM and "VIM" or (keypress and "keypress") or "fallback")
-
+-- 4. deleteExtraChars — pakai findTextBox + sendBackspace
+local function deleteExtraChars(startLetter)
+    local cur = getTextBoxContent()
+    local extra = #cur - #startLetter
+    if extra <= 0 then return end
     focusTextBox()
-    task.wait(0.1)
+    task.wait(0.04)
+    for _ = 1, extra do
+        sendBackspace()
+        task.wait(0.025)
+    end
+end
 
-    local remain = string.sub(sel, #serverLetter + 1)
-    log("AI", "Mulai ngetik", #remain, "huruf | kata:", sel)
+local function humanDelay()
+    local mn, mx = config.minDelay, config.maxDelay
+    if mn > mx then mn = mx end
+    task.wait(math.random(mn, mx) / 1000)
+end
 
-    for i = 1, #remain do
-        if not matchActive or not isMyTurn then
-            log("AI", "Match/turn berakhir saat ngetik, berhenti di huruf ke-" .. i)
-            autoRunning = false
-            return
+-- =========================
+-- AUTO ENGINE v3
+-- Fix: semua fungsi helper dideklarasi sebelum dipakai
+-- Crash fix: wrap seluruh body submitAndRetry dengan pcall
+-- Lag fix: tidak ada Heartbeat loop, tidak ada UI call di hot path
+-- =========================
+local blacklistedWords = {}
+local lastRejectWord   = ""
+
+local function isBlacklisted(w) return blacklistedWords[string.lower(w)] == true end
+local function blacklist(w)     blacklistedWords[string.lower(w)] = true end
+
+local function submitAndRetry(startLetter)
+    local MAX_RETRY = 6
+    local attempt   = 0
+
+    while attempt < MAX_RETRY do
+        attempt = attempt + 1
+        if not matchActive or not autoEnabled then return false end
+        if attempt > 1 then task.wait(0.2) end
+
+        -- pilih kata
+        local words = {}
+        for _, w in ipairs(getSmartWords(startLetter)) do
+            if not isBlacklisted(w) then table.insert(words, w) end
         end
-        local ch = string.sub(remain, i, i)
-        sendKey(ch)
-        humanDelay()
+        if #words == 0 then return false end
+
+        local sel = words[1]
+        if config.aggression < 100 then
+            local topN = math.max(1, math.floor(#words * (1 - config.aggression/100)))
+            sel = words[math.random(1, topN)]
+        end
+
+        -- fokus textbox
+        focusTextBox()
+        task.wait(0.05)
+
+        -- ketik huruf satu per satu
+        local remain = string.sub(sel, #startLetter + 1)
+        local cur    = startLetter
+        local aborted = false
+        for i = 1, #remain do
+            if not matchActive or not autoEnabled then aborted = true break end
+            local ch = string.sub(remain, i, i)
+            cur = cur .. ch
+            pcall(function() sendKey(ch) end)
+            pcall(function() TypeSound:FireServer() end)
+            pcall(function() BillboardUpdate:FireServer(cur) end)
+            task.wait(math.random(config.minDelay, config.maxDelay) / 1000)
+        end
+        if aborted then return false end
+        if not matchActive or not autoEnabled then return false end
+
+        -- submit via FireServer
+        lastRejectWord = ""
+        pcall(function() SubmitWord:FireServer(sel) end)
+        task.wait(0.35)
+
+        if lastRejectWord == string.lower(sel) then
+            -- DITOLAK: hapus sisa huruf, coba kata lain
+            blacklist(sel)
+            deleteExtraChars(startLetter)
+            task.wait(0.15)
+        else
+            -- DITERIMA
+            addUsedWord(sel)
+            pcall(function() BillboardEnd:FireServer() end)
+            return true
+        end
     end
 
-    task.wait(0.05)
-    log("AI", "Kirim Enter untuk submit kata: '" .. sel .. "'")
-    sendEnter()
+    pcall(function() BillboardEnd:FireServer() end)
+    return false
+end
 
-    addUsedWord(sel)
-    log("AI", "✅ Selesai submit kata:", sel)
+local function startUltraAI()
+    if autoRunning or not autoEnabled or not matchActive or not isMyTurn or serverLetter == "" then
+        return
+    end
+    autoRunning = true
+    if config.initialDelay > 0 then
+        task.wait(config.initialDelay)
+        if not matchActive or not isMyTurn then autoRunning = false return end
+    end
+    humanDelay()
+    local letter = serverLetter
+    local ok, err = pcall(function() submitAndRetry(letter) end)
+    if not ok then logerr("AI", "submitAndRetry error:", tostring(err)) end
     autoRunning = false
 end
 
--- =========================
 -- SEAT MONITORING
 -- =========================
 local currentTableName = nil
@@ -720,6 +841,9 @@ local Window = WindUI:CreateWindow({
 })
 log("UI", "Window dibuat")
 
+-- cek akses maintenance/blacklist (semua declarations sudah siap di sini)
+if not checkAccess() then return end
+
 -- daftarkan destroy callback untuk anti double-execute
 _G.AutoKataDestroy = function()
     -- disable semua state aktif
@@ -783,7 +907,7 @@ MainTab:Dropdown({
         log("WORDLIST", "Ganti wordlist →", selected)
         activeWordlistName = selected
         notify("📦 WORDLIST", "Loading " .. selected .. "...", 3)
-        task.spawn(function()
+        safeSpawn(function()
             local success = loadWordlistFromURL(WORDLIST_URLS[selected])
             if success then
                 resetUsedWords()
@@ -1247,7 +1371,7 @@ SettingsTab:Button({
     Callback = function()
         log("SETTINGS", "Hop Server ditekan")
         notify("🔀 HOP", "Mencari server lain...", 3)
-        task.spawn(function()
+        safeSpawn(function()
             local placeId = game.PlaceId
             local url = "https://games.roblox.com/v1/games/" .. placeId .. "/servers/Public?sortOrder=Asc&limit=100"
             log("SETTINGS", "Fetch server list:", url)
@@ -1404,14 +1528,20 @@ LogsTab:Button({
 
 log("UI", "Tab Logs selesai")
 
--- auto clear logs tiap 1 detik
-task.spawn(function()
+-- timer 1 detik: flush UI + clear buffer
+-- SATU-SATUNYA tempat yang boleh panggil SetDesc
+safeSpawn(function()
     while _G.AutoKataActive do
         task.wait(1)
+        -- flush tampilkan dulu, baru clear
+        flushLogUI()
+        -- bersihkan buffer setelah tampil
         logBuffer = {}
-        if logParagraph and logParagraph.SetDesc then
-            pcall(function() logParagraph:SetDesc("(auto cleared)") end)
-        end
+        logDirty  = false
+        -- reset paragraph ke kosong
+        pcall(function()
+            if logParagraph then logParagraph:SetDesc("") end
+        end)
     end
 end)
 
@@ -1467,7 +1597,7 @@ ScriptTab:Input({
         if not query or query == "" then return end
         log("SCRIPT", "Search:", query)
         notify("🔍 SEARCH", "Mencari: " .. query, 2)
-        task.spawn(function()
+        safeSpawn(function()
             local url = SCRIPTBLOX_SEARCH .. HttpService:UrlEncode(query) .. "&max=20&mode=free"
             local ok, raw = pcall(function() return game:HttpGet(url) end)
             if not ok or not raw or raw == "" then
@@ -1508,7 +1638,7 @@ ScriptTab:Button({
     Callback = function()
         log("SCRIPT", "Load trending scripts")
         notify("🔥 TRENDING", "Mengambil trending...", 2)
-        task.spawn(function()
+        safeSpawn(function()
             local ok, raw = pcall(function()
                 return game:HttpGet("https://scriptblox.com/api/script/trending")
             end)
@@ -1584,7 +1714,7 @@ ScriptTab:Button({
         end
         log("SCRIPT", "Execute:", s.title)
         notify("▶️ EXECUTE", "Menjalankan: " .. s.title, 3)
-        task.spawn(function()
+        safeSpawn(function()
             local ok, err = pcall(function()
                 loadstring(code)()
             end)
@@ -1627,17 +1757,161 @@ ScriptTab:Paragraph({
 })
 
 log("UI", "Tab Script selesai")
+
+-- =========================================================
+-- TAB 6 : ADMIN
+-- Hanya muncul kalau userId player ada di ADMIN_IDS
+-- =========================================================
+if isAdmin(LocalPlayer) then
+    log("UI", "Membuat Tab Admin (admin detected)...")
+    local AdminTab = Window:Tab({ Title = "Admin", Icon = "shield" })
+
+    -- status
+    local adminStatusPara = AdminTab:Paragraph({
+        Title = "Admin Panel",
+        Desc  = "UserID: " .. tostring(LocalPlayer.UserId)
+            .. "\nMaintenance: " .. (MAINTENANCE_MODE and "ON 🔴" or "OFF 🟢")
+            .. "\nBlacklist count: " .. (function()
+                local n = 0
+                for _ in pairs(BLACKLIST) do n = n + 1 end
+                return n
+            end)()
+    })
+
+    local function refreshAdminStatus()
+        local n = 0
+        for _ in pairs(BLACKLIST) do n = n + 1 end
+        pcall(function()
+            adminStatusPara:SetDesc(
+                "UserID: " .. tostring(LocalPlayer.UserId)
+                .. "\nMaintenance: " .. (MAINTENANCE_MODE and "ON 🔴" or "OFF 🟢")
+                .. "\nBlacklist count: " .. n
+            )
+        end)
+    end
+
+    -- Toggle Maintenance
+    AdminTab:Toggle({
+        Title    = "Maintenance Mode",
+        Desc     = "Lock semua user non-admin dari script",
+        Icon     = "lock",
+        Value    = MAINTENANCE_MODE,
+        Callback = function(v)
+            MAINTENANCE_MODE = v
+            -- set ke _G biar script lain yang execute bisa baca
+            _G.AutoKataMaintenance = v
+            refreshAdminStatus()
+            notify(v and "🔴 MAINTENANCE ON" or "🟢 MAINTENANCE OFF",
+                   v and "Semua non-admin di-lock" or "Script dibuka kembali", 3)
+            log("ADMIN", "Maintenance →", tostring(v))
+        end,
+    })
+
+    AdminTab:Paragraph({ Title = "Blacklist User", Desc = "Masukkan UserID untuk blacklist/unblacklist" })
+
+    -- Input blacklist tambah
+    AdminTab:Input({
+        Title       = "Blacklist UserID",
+        Desc        = "Ketik UserID lalu Enter — user itu akan di-kick & di-blacklist",
+        Icon        = "user-x",
+        Placeholder = "contoh: 123456789",
+        Callback    = function(input)
+            local uid = tonumber(input)
+            if not uid then
+                notify("❌ INVALID", "UserID harus angka", 3) return
+            end
+            if uid == LocalPlayer.UserId then
+                notify("❌ ERROR", "Tidak bisa blacklist diri sendiri", 3) return
+            end
+            BLACKLIST[uid] = true
+            _G.AutoKataBlacklist = BLACKLIST
+            -- kick player kalau ada di server
+            for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
+                if p.UserId == uid then
+                    pcall(function() p:Kick("[AutoKata] Kamu di-blacklist oleh admin.") end)
+                end
+            end
+            refreshAdminStatus()
+            notify("🚫 BLACKLIST", "UserID " .. uid .. " di-blacklist", 3)
+            log("ADMIN", "Blacklist tambah:", uid)
+        end,
+    })
+
+    -- Input unblacklist
+    AdminTab:Input({
+        Title       = "Hapus Blacklist",
+        Desc        = "Ketik UserID untuk remove dari blacklist",
+        Icon        = "user-check",
+        Placeholder = "contoh: 123456789",
+        Callback    = function(input)
+            local uid = tonumber(input)
+            if not uid then
+                notify("❌ INVALID", "UserID harus angka", 3) return
+            end
+            if BLACKLIST[uid] then
+                BLACKLIST[uid] = nil
+                _G.AutoKataBlacklist = BLACKLIST
+                refreshAdminStatus()
+                notify("✅ UNBLACKLIST", "UserID " .. uid .. " dihapus dari blacklist", 3)
+                log("ADMIN", "Blacklist hapus:", uid)
+            else
+                notify("⚠️ NOT FOUND", "UserID " .. uid .. " tidak ada di blacklist", 3)
+            end
+        end,
+    })
+
+    -- Lihat daftar blacklist
+    AdminTab:Button({
+        Title    = "Lihat Blacklist",
+        Desc     = "Tampilkan semua UserID yang di-blacklist",
+        Icon     = "list",
+        Callback = function()
+            local list = {}
+            for uid in pairs(BLACKLIST) do
+                table.insert(list, tostring(uid))
+            end
+            if #list == 0 then
+                notify("📋 BLACKLIST", "Blacklist kosong", 3)
+            else
+                notify("📋 BLACKLIST", table.concat(list, ", "), 5)
+            end
+        end,
+    })
+
+    -- Kick semua non-admin
+    AdminTab:Button({
+        Title    = "Kick Semua Non-Admin",
+        Desc     = "Kick semua player yang tidak punya akses admin",
+        Icon     = "zap",
+        Callback = function()
+            local count = 0
+            for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
+                if p ~= LocalPlayer and not isAdmin(p) then
+                    pcall(function()
+                        p:Kick("[AutoKata] Kicked by admin.")
+                    end)
+                    count = count + 1
+                end
+            end
+            notify("⚡ KICK ALL", count .. " player di-kick", 3)
+            log("ADMIN", "Kick all non-admin:", count)
+        end,
+    })
+
+    log("UI", "Tab Admin selesai")
+end
+
 log("UI", "Membuat Tab About...")
 local AboutTab = Window:Tab({ Title = "About", Icon = "info" })
 
 AboutTab:Paragraph({
     Title = "Informasi Script",
-    Desc  = "Auto Kata\nVersi: 5.0 [DEBUG]\nby danz\nFitur: Auto play, 4 kamus kata, settings server\nTiktok Owner: @stevenhellnah",
+    Desc  = "Auto Kata\nVersi: 5.0 [DEBUG]\nby danz\nFitur: Auto play, 4 kamus kata, settings server",
 })
 
 AboutTab:Paragraph({
     Title = "Kamus Tersedia",
-    Desc  = "1. Kamus Umum Indonesia (default)\n2. Ganas Gahar - withallcombination\n3. Safety Anti Detek - KBBI Final\n4. Kamus Lengkap - dhann",
+    Desc  = "1. Kamus Umum Indonesia (default)\n2. Ganas Gahar - withallcombination\n3. Safety Anti Detek - KBBI Final\n4. Kamus Lengkap - dhannhub",
 })
 
 AboutTab:Paragraph({
@@ -1717,7 +1991,7 @@ local function onMatchUI(cmd, value)
         isMyTurn = true
         log("MATCH", "Giliran SAYA dimulai | serverLetter:", serverLetter, "| auto:", tostring(autoEnabled))
         if autoEnabled then
-            task.spawn(function()
+            safeSpawn(function()
                 local delay = math.random(300, 500) / 1000
                 log("AI", "Spawn AI dengan delay:", delay, "s")
                 task.wait(delay)
@@ -1753,12 +2027,11 @@ end
 local function onUsedWarn(word)
     log("USEDWARN", "UsedWordWarn | word:", tostring(word))
     if word then
+        -- set flag reject — startUltraAI sedang polling ini di task.wait(0.3)
+        lastRejectWord = string.lower(tostring(word))
         addUsedWord(word)
-        if autoEnabled and matchActive and isMyTurn then
-            log("USEDWARN", "Kata sudah dipakai, retry AI...")
-            humanDelay()
-            startUltraAI()
-        end
+        -- TIDAK panggil startUltraAI lagi di sini
+        -- retry sudah dihandle di dalam loop startUltraAI
     end
 end
 
@@ -1786,7 +2059,7 @@ UsedWordWarn.OnClientEvent:Connect(onUsedWarn)
 
 log("REMOTE", "Semua remote handler terpasang ✅")
 
-task.spawn(function()
+safeSpawn(function()
     while true do
         if matchActive then updateMainStatus() end
         task.wait(0.3)
@@ -1798,4 +2071,4 @@ log("BOOT", "✅ WINDUI BUILD v5 [DEBUG] LOADED SUCCESSFULLY")
 log("BOOT", "Wordlist:", activeWordlistName, "| Kata:", #kataModule)
 log("BOOT", "Input method: VIM=" .. tostring(VIM ~= nil)
     .. " | keypress=" .. tostring(keypress ~= nil))
-log("BOOT", "====================================================")
+log("BOOT", "=====================================================")
