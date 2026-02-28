@@ -168,15 +168,60 @@ log("SERVICES", "LocalPlayer:", LocalPlayer.Name)
 -- ADMIN CONFIG
 -- Isi userId admin di sini
 -- =========================
+-- =========================
+-- ADMIN SYSTEM
+-- Blacklist & Maintenance disimpan permanen ke file lokal executor
+-- File: workspace/autokata_admin.json
+-- =========================
 local ADMIN_IDS = {
-   3379547587,
+    3379547587
 }
 
-local MAINTENANCE_MODE = false   -- set true = semua user non-admin kena lock
-local BLACKLIST        = {}      -- { [userId] = true }
+local ADMIN_FILE       = "autokata_admin.json"
+local MAINTENANCE_MODE = false
+local BLACKLIST        = {}   -- { [userId(number)] = true }
+
+-- simpan state ke file
+local function adminSave()
+    local data = {
+        maintenance = MAINTENANCE_MODE,
+        blacklist   = {},
+    }
+    for uid in pairs(BLACKLIST) do
+        table.insert(data.blacklist, uid)
+    end
+    local ok, encoded = pcall(function()
+        return game:GetService("HttpService"):JSONEncode(data)
+    end)
+    if ok then
+        pcall(function() writefile(ADMIN_FILE, encoded) end)
+    end
+end
+
+-- load state dari file
+local function adminLoad()
+    local ok, raw = pcall(function() return readfile(ADMIN_FILE) end)
+    if not ok or not raw or raw == "" then return end
+    local ok2, data = pcall(function()
+        return game:GetService("HttpService"):JSONDecode(raw)
+    end)
+    if not ok2 or not data then return end
+    if type(data.maintenance) == "boolean" then
+        MAINTENANCE_MODE = data.maintenance
+    end
+    if type(data.blacklist) == "table" then
+        for _, uid in ipairs(data.blacklist) do
+            BLACKLIST[tonumber(uid)] = true
+        end
+    end
+end
+
+-- load saat boot
+adminLoad()
 
 local function isAdmin(player)
     local uid = player and player.UserId
+    if not uid then return false end
     for _, id in ipairs(ADMIN_IDS) do
         if id == uid then return true end
     end
@@ -184,12 +229,20 @@ local function isAdmin(player)
 end
 
 local function checkAccess()
+    -- reload file terbaru setiap kali check (biar sync kalau admin update)
+    adminLoad()
     if MAINTENANCE_MODE and not isAdmin(LocalPlayer) then
-        LocalPlayer:Kick("[AutoKata] Maintenance Mode aktif. Coba lagi nanti.")
+        task.wait(0.1)
+        pcall(function()
+            LocalPlayer:Kick("[AutoKata] Maintenance Mode aktif. Coba lagi nanti.")
+        end)
         return false
     end
     if BLACKLIST[LocalPlayer.UserId] then
-        LocalPlayer:Kick("[AutoKata] Kamu di-blacklist dari script ini.")
+        task.wait(0.1)
+        pcall(function()
+            LocalPlayer:Kick("[AutoKata] Kamu di-blacklist dari script ini.")
+        end)
         return false
     end
     return true
@@ -399,6 +452,7 @@ if not wordOk or #kataModule == 0 then
     return
 end
 log("WORDLIST", "Default wordlist siap:", #kataModule, "kata")
+-- buildIndex dipanggil nanti setelah fungsinya dideklarasi
 
 -- =========================
 -- REMOTES
@@ -422,6 +476,10 @@ local TypeSound       = waitRemote("TypeSound")
 local UsedWordWarn    = waitRemote("UsedWordWarn")
 local JoinTable       = waitRemote("JoinTable")
 local LeaveTable      = waitRemote("LeaveTable")
+local PlayerHit     = nil
+local PlayerCorrect = nil
+pcall(function() PlayerHit     = remotes:WaitForChild("PlayerHit",     3) end)
+pcall(function() PlayerCorrect = remotes:WaitForChild("PlayerCorrect", 3) end)
 log("REMOTE", "Semua remote siap")
 
 -- =========================
@@ -430,11 +488,28 @@ log("REMOTE", "Semua remote siap")
 local matchActive        = false
 local isMyTurn           = false
 local serverLetter       = ""
-local usedWords          = {}
-local usedWordsList      = {}
+local usedWords          = {}  -- hash table: { [word] = true }
 local opponentStreamWord = ""
 local autoEnabled        = false
 local autoRunning        = false
+local lastAttemptedWord  = ""  -- kata terakhir yang dicoba submit
+
+-- wrong words: kata yang terbukti salah di game (dari file online)
+local wrongWordsSet      = {}
+-- ranking: skor kata (prioritas submit)
+local rankingMap         = {}
+-- index per huruf awal untuk search cepat
+local wordsByFirstLetter = {}
+-- inactivity timeout
+local INACTIVITY_TIMEOUT = 6
+local lastTurnActivity   = 0
+
+-- blacklistedWords harus ada sebelum getSmartWords
+local blacklistedWords = {}
+local lastRejectWord   = ""
+
+local function isBlacklisted(w) return blacklistedWords[string.lower(w)] == true end
+local function blacklist(w)     blacklistedWords[string.lower(w)] = true end
 
 local config = {
     minDelay     = 500,
@@ -442,7 +517,8 @@ local config = {
     aggression   = 20,
     minLength    = 2,
     maxLength    = 12,
-    initialDelay = 0.0,  -- jeda awal sebelum mulai ngetik (detik), max 2.0
+    initialDelay = 0.0,  -- jeda awal sebelum mulai ngetik (detik)
+    submitDelay  = 1.0,  -- jeda sebelum submit kata (detik), bisa di-custom
 }
 
 log("STATE", "State initialized | config:", "minDelay=" .. config.minDelay, "maxDelay=" .. config.maxDelay)
@@ -454,42 +530,146 @@ local function isUsed(word)
     return usedWords[string.lower(word)] == true
 end
 
-local usedWordsDropdown = nil
-
+-- usedWords: hash table saja, no UI, no list, no log — murni backend
 local function addUsedWord(word)
-    local w = string.lower(word)
-    if not usedWords[w] then
-        usedWords[w] = true
-        table.insert(usedWordsList, word)
-        log("USEDWORDS", "Tambah kata:", w, "| total:", #usedWordsList)
-        if usedWordsDropdown and usedWordsDropdown.Refresh then
-            pcall(function() usedWordsDropdown:Refresh(usedWordsList) end)
-        end
-    end
+    usedWords[string.lower(word)] = true
 end
 
 local function resetUsedWords()
-    usedWords, usedWordsList = {}, {}
-    log("USEDWORDS", "Reset used words")
-    if usedWordsDropdown and usedWordsDropdown.Refresh then
-        pcall(function() usedWordsDropdown:Refresh({}) end)
-    end
+    usedWords = {}  -- reset hash, itulah satu-satunya storage
 end
 
-local function getSmartWords(prefix)
-    local results     = {}
-    local lowerPrefix = string.lower(prefix)
-    for i = 1, #kataModule do
-        local word = kataModule[i]
-        if string.sub(word, 1, #lowerPrefix) == lowerPrefix and not isUsed(word) then
-            local len = #word
-            if len >= config.minLength and len <= config.maxLength then
-                table.insert(results, word)
+-- =========================
+-- WRONG WORDLIST + RANKING + INDEX (dari txt)
+-- =========================
+local WRONG_WORDS_URL = "https://raw.githubusercontent.com/fay23-dam/sazaraaax-script/refs/heads/main/wordworng/a3x.lua"
+local RANKING_URL     = "https://raw.githubusercontent.com/fay23-dam/sazaraaax-script/refs/heads/main/wordworng/ranking_kata.json"
+local HttpService     = game:GetService("HttpService")
+
+local function downloadWrongWordlist()
+    local ok, raw = pcall(function() return game:HttpGet(WRONG_WORDS_URL) end)
+    if not ok or not raw or raw == "" then return end
+    local fn = loadstring(raw)
+    if not fn then return end
+    local words = fn()
+    if type(words) ~= "table" then return end
+    table.clear(wrongWordsSet)
+    for _, w in ipairs(words) do
+        if type(w) == "string" then
+            wrongWordsSet[string.lower(w)] = true
+        end
+    end
+    log("WRONGWORD", "Wrong wordlist loaded:", "total=" .. tostring(#words))
+end
+
+local function loadRanking()
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(game:HttpGet(RANKING_URL))
+    end)
+    if not ok or type(data) ~= "table" then return end
+    table.clear(rankingMap)
+    for _, v in ipairs(data) do
+        if type(v) == "table" and type(v.word) == "string" then
+            local w = string.lower(v.word)
+            if w:match("^[a-z]+$") then
+                rankingMap[w] = tonumber(v.score) or 0
             end
         end
     end
+    log("RANKING", "Ranking loaded, total entries:", tostring(#data))
+end
+
+-- build index per huruf pertama untuk search lebih cepat
+local function buildIndex()
+    wordsByFirstLetter = {}
+    for i = 1, #kataModule do
+        local word  = kataModule[i]
+        local first = string.sub(word, 1, 1)
+        local bucket = wordsByFirstLetter[first]
+        if bucket then
+            bucket[#bucket + 1] = word
+        else
+            wordsByFirstLetter[first] = { word }
+        end
+    end
+    log("INDEX", "Index kata selesai dibangun")
+end
+
+-- jalankan sekarang setelah fungsi dideklarasi
+safeSpawn(buildIndex)
+safeSpawn(downloadWrongWordlist)
+safeSpawn(loadRanking)
+
+-- clearToStartWord: hapus huruf satu-satu via Billboard sampai kembali ke serverLetter
+-- dipanggil kalau server kirim Mistake / UsedWordWarn
+local function clearToStartWord()
+    if serverLetter == "" then return end
+    -- gunakan kata yang terakhir diketik bot, fallback ke opponentStreamWord
+    local current = lastAttemptedWord ~= "" and lastAttemptedWord
+        or (opponentStreamWord ~= "" and opponentStreamWord)
+        or serverLetter
+    -- mundur satu huruf per step lewat Billboard (seperti hapus manual)
+    while #current > #serverLetter do
+        current = string.sub(current, 1, #current - 1)
+        pcall(function() BillboardUpdate:FireServer(current) end)
+        pcall(function() TypeSound:FireServer() end)
+        task.wait(0.08)
+    end
+    pcall(function() BillboardEnd:FireServer() end)
+    lastAttemptedWord = ""  -- reset setelah clear
+end
+
+local function getSmartWords(prefix)
+    if #kataModule == 0 then return {} end
+    if prefix == "" then return {} end
+
+    local lowerPrefix = string.lower(prefix)
+    local first       = string.sub(lowerPrefix, 1, 1)
+
+    -- pakai index kalau sudah dibangun, fallback ke full scan
+    local bucket = (next(wordsByFirstLetter) ~= nil)
+        and wordsByFirstLetter[first]
+        or kataModule
+
+    if not bucket then return {} end
+
+    local rankedBestWord  = nil
+    local rankedBestScore = -math.huge
+    local results         = {}
+    local fallback        = {}
+
+    for _, word in ipairs(bucket) do
+        if string.sub(word, 1, #lowerPrefix) == lowerPrefix
+            and #word > #lowerPrefix
+            and not isUsed(word)
+            and not wrongWordsSet[word]
+            and not blacklistedWords[word]
+        then
+            -- cek ranking — kalau ada skor, kandidat terbaik
+            local score = rankingMap[word]
+            if score and score > rankedBestScore then
+                rankedBestScore = score
+                rankedBestWord  = word
+            end
+
+            fallback[#fallback + 1] = word
+
+            local len = #word
+            if len >= config.minLength and len <= config.maxLength then
+                results[#results + 1] = word
+            end
+        end
+    end
+
+    -- prioritas: kata dengan ranking tertinggi langsung return
+    if rankedBestWord then
+        return { rankedBestWord }
+    end
+
+    -- fallback: kalau tidak ada yang masuk filter panjang, pakai semua
+    if #results == 0 then results = fallback end
+
     table.sort(results, function(a, b) return #a > #b end)
-    log("SEARCH", "Prefix='" .. prefix .. "' → ditemukan:", #results, "kata")
     return results
 end
 
@@ -628,15 +808,7 @@ end
 
 -- =========================
 -- AUTO ENGINE v3
--- Fix: semua fungsi helper dideklarasi sebelum dipakai
--- Crash fix: wrap seluruh body submitAndRetry dengan pcall
--- Lag fix: tidak ada Heartbeat loop, tidak ada UI call di hot path
 -- =========================
-local blacklistedWords = {}
-local lastRejectWord   = ""
-
-local function isBlacklisted(w) return blacklistedWords[string.lower(w)] == true end
-local function blacklist(w)     blacklistedWords[string.lower(w)] = true end
 
 local function submitAndRetry(startLetter)
     local MAX_RETRY = 6
@@ -655,8 +827,9 @@ local function submitAndRetry(startLetter)
         if #words == 0 then return false end
 
         local sel = words[1]
-        if config.aggression < 100 then
+        if #words > 1 and config.aggression < 100 then
             local topN = math.max(1, math.floor(#words * (1 - config.aggression/100)))
+            topN = math.min(topN, #words)
             sel = words[math.random(1, topN)]
         end
 
@@ -680,8 +853,15 @@ local function submitAndRetry(startLetter)
         if aborted then return false end
         if not matchActive or not autoEnabled then return false end
 
+        -- jeda sebelum submit (custom, default 1 detik)
+        if config.submitDelay > 0 then
+            task.wait(config.submitDelay)
+        end
+        if not matchActive or not autoEnabled then return false end
+
         -- submit via FireServer
-        lastRejectWord = ""
+        lastRejectWord    = ""
+        lastAttemptedWord = sel  -- catat kata yang dicoba, untuk clearToStartWord
         pcall(function() SubmitWord:FireServer(sel) end)
         task.wait(0.35)
 
@@ -693,20 +873,36 @@ local function submitAndRetry(startLetter)
         else
             -- DITERIMA
             addUsedWord(sel)
+            lastAttemptedWord = ""
             pcall(function() BillboardEnd:FireServer() end)
             return true
         end
     end
 
+    -- habis MAX_RETRY — clear blacklist sesi supaya tidak stuck
+    blacklistedWords = {}
     pcall(function() BillboardEnd:FireServer() end)
     return false
 end
 
 local function startUltraAI()
-    if autoRunning or not autoEnabled or not matchActive or not isMyTurn or serverLetter == "" then
-        return
+    if autoRunning or not autoEnabled or not matchActive or not isMyTurn then return end
+    -- kalau serverLetter masih kosong, tunggu max 5 detik
+    if serverLetter == "" then
+        local waited = 0
+        while serverLetter == "" and waited < 5 do
+            task.wait(0.1)
+            waited = waited + 0.1
+        end
+        if serverLetter == "" then
+            log("AI", "serverLetter kosong setelah tunggu 5s, skip")
+            return
+        end
     end
-    autoRunning = true
+    if not matchActive or not isMyTurn or not autoEnabled then return end
+    if autoRunning then return end
+    autoRunning      = true
+    lastTurnActivity = tick()
     if config.initialDelay > 0 then
         task.wait(config.initialDelay)
         if not matchActive or not isMyTurn then autoRunning = false return end
@@ -763,36 +959,42 @@ local function setupSeatMonitoring()
     log("SEAT", "Setup selesai | seat count:", count)
 end
 
-local heartbeatAccum = 0
-RunService.Heartbeat:Connect(function(dt)
-    -- throttle: cek tiap 0.1 detik, bukan tiap frame
-    heartbeatAccum = heartbeatAccum + dt
-    if heartbeatAccum < 0.1 then return end
-    heartbeatAccum = 0
-
-    if not matchActive or not tableTarget or not currentTableName then return end
-    for seat, state in pairs(seatStates) do
-        local plr = getSeatPlayer(seat)
-        if plr and plr ~= LocalPlayer then
-            if not state.Current or state.Current.Player ~= plr then
-                state.Current = monitorTurnBillboard(plr)
-            end
-            if state.Current then
-                local tb = state.Current.TextLabel
-                if tb then state.Current.LastText = tb.Text end
-                if not state.Current.Billboard or not state.Current.Billboard.Parent then
-                    if state.Current.LastText ~= "" then
-                        -- log hanya sekali saat billboard hilang, bukan tiap frame
-                        log("SEAT", "Billboard hilang, addUsedWord:", state.Current.LastText)
-                        addUsedWord(state.Current.LastText)
-                    end
-                    state.Current = nil
+-- Seat monitor: task.spawn loop 6x/detik (bukan Heartbeat 60x/detik)
+-- Heartbeat:Connect jauh lebih berat karena jalan tiap frame walau di-throttle
+safeSpawn(function()
+    while _G.AutoKataActive do
+        task.wait(1 / 6)
+        if matchActive and tableTarget and currentTableName then
+            -- inactivity timeout
+            if isMyTurn and autoEnabled then
+                if tick() - lastTurnActivity > INACTIVITY_TIMEOUT then
+                    lastTurnActivity = tick()
+                    autoRunning = false  -- reset kalau stuck
+                    safeSpawn(startUltraAI)
                 end
             end
-        else
-            if state.Current then state.Current = nil end
-        end
-    end
+            for seat, state in pairs(seatStates) do
+                local plr = getSeatPlayer(seat)
+                if plr and plr ~= LocalPlayer then
+                    if not state.Current or state.Current.Player ~= plr then
+                        state.Current = monitorTurnBillboard(plr)
+                    end
+                    if state.Current then
+                        local tb = state.Current.TextLabel
+                        if tb then state.Current.LastText = tb.Text end
+                        if not state.Current.Billboard or not state.Current.Billboard.Parent then
+                            if state.Current.LastText ~= "" then
+                                addUsedWord(state.Current.LastText)
+                            end
+                            state.Current = nil
+                        end
+                    end
+                else
+                    if state.Current then state.Current = nil end
+                end
+            end
+        end  -- if matchActive
+    end  -- while
 end)
 
 local function onCurrentTableChanged()
@@ -830,7 +1032,7 @@ end)
 -- =========================
 log("UI", "Membuat window WindUI...")
 local Window = WindUI:CreateWindow({
-    Title         = "Sambung-kata 5.0",
+    Title         = "Sambung-kata",
     Icon          = "zap",
     Author        = "by danz",
     Folder        = "SambungKata",
@@ -888,8 +1090,12 @@ autoToggle = MainTab:Toggle({
         if Value then
             if getWordsToggle then getWordsToggle:Set(false) end
             notify("⚡ AUTO MODE", "Auto Dinyalakan - " .. activeWordlistName, 3)
-            startUltraAI()
+            -- hanya trigger kalau sudah dalam match dan giliran
+            if matchActive and isMyTurn and serverLetter ~= "" then
+                safeSpawn(startUltraAI)
+            end
         else
+            autoRunning = false
             notify("⚡ AUTO MODE", "Auto Dimatikan", 3)
         end
     end,
@@ -1065,18 +1271,37 @@ MainTab:Input({
         local n = parseNumber(raw)
         if not n then
             notify("❌ INPUT", "Jeda Awal bukan angka valid: " .. tostring(raw), 3)
-            log("CONFIG", "initialDelay input invalid:", raw)
             return
         end
-        -- auto-clamp ke max 3.0
         if n > 3.0 then
             n = 3.0
             notify("⚠️ JEDA AWAL", "Diatas 3 detik, di-set otomatis ke 3,0 detik", 3)
         end
         n = math.max(0.0, n)
         config.initialDelay = n
-        log("CONFIG", "initialDelay →", n, "s (input:", raw .. ")")
         notify("✅ JEDA AWAL", "Jeda awal: " .. n .. " detik", 2)
+    end,
+})
+
+-- Jeda Submit input — jeda sebelum bot submit kata (default 1 detik)
+MainTab:Input({
+    Title       = "Jeda Submit (detik)",
+    Desc        = "Jeda setelah ngetik selesai, sebelum submit kata — default: 1,0 (maks 5,0)",
+    Icon        = "timer",
+    Placeholder = "contoh: 1,0 atau 0,5",
+    Callback    = function(raw)
+        local n = parseNumber(raw)
+        if not n then
+            notify("❌ INPUT", "Jeda Submit bukan angka valid: " .. tostring(raw), 3)
+            return
+        end
+        if n > 5.0 then
+            n = 5.0
+            notify("⚠️ JEDA SUBMIT", "Diatas 5 detik, di-set ke 5,0", 3)
+        end
+        n = math.max(0.0, n)
+        config.submitDelay = n
+        notify("✅ JEDA SUBMIT", "Jeda submit: " .. n .. " detik", 2)
     end,
 })
 
@@ -1084,7 +1309,7 @@ MainTab:Slider({
     Title    = "Min Word Length",
     Desc     = "Panjang kata minimum",
     Icon     = "type",
-    Value    = { Min = 1, Max = 2, Default = config.minLength, Decimals = 0 },
+    Value    = { Min = 2, Max = 20, Default = config.minLength, Decimals = 0 },
     Callback = function(v)
         config.minLength = v
         log("CONFIG", "minLength →", v)
@@ -1100,16 +1325,6 @@ MainTab:Slider({
         config.maxLength = v
         log("CONFIG", "maxLength →", v)
     end,
-})
-
-usedWordsDropdown = MainTab:Dropdown({
-    Title    = "Used Words",
-    Desc     = "Kata-kata yang sudah dipakai dalam match",
-    Icon     = "list",
-    Values   = {},
-    Value    = nil,
-    Multi    = false,
-    Callback = function() end,
 })
 
 local statusParagraph = MainTab:Paragraph({
@@ -1798,11 +2013,10 @@ if isAdmin(LocalPlayer) then
         Value    = MAINTENANCE_MODE,
         Callback = function(v)
             MAINTENANCE_MODE = v
-            -- set ke _G biar script lain yang execute bisa baca
-            _G.AutoKataMaintenance = v
+            adminSave()  -- simpan permanen ke file
             refreshAdminStatus()
             notify(v and "🔴 MAINTENANCE ON" or "🟢 MAINTENANCE OFF",
-                   v and "Semua non-admin di-lock" or "Script dibuka kembali", 3)
+                   v and "Non-admin di-lock (tersimpan)" or "Dibuka kembali (tersimpan)", 3)
             log("ADMIN", "Maintenance →", tostring(v))
         end,
     })
@@ -1824,7 +2038,7 @@ if isAdmin(LocalPlayer) then
                 notify("❌ ERROR", "Tidak bisa blacklist diri sendiri", 3) return
             end
             BLACKLIST[uid] = true
-            _G.AutoKataBlacklist = BLACKLIST
+            adminSave()  -- simpan permanen ke file
             -- kick player kalau ada di server
             for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
                 if p.UserId == uid then
@@ -1832,7 +2046,7 @@ if isAdmin(LocalPlayer) then
                 end
             end
             refreshAdminStatus()
-            notify("🚫 BLACKLIST", "UserID " .. uid .. " di-blacklist", 3)
+            notify("🚫 BLACKLIST", "UserID " .. uid .. " di-blacklist (tersimpan)", 3)
             log("ADMIN", "Blacklist tambah:", uid)
         end,
     })
@@ -1850,9 +2064,9 @@ if isAdmin(LocalPlayer) then
             end
             if BLACKLIST[uid] then
                 BLACKLIST[uid] = nil
-                _G.AutoKataBlacklist = BLACKLIST
+                adminSave()  -- simpan permanen ke file
                 refreshAdminStatus()
-                notify("✅ UNBLACKLIST", "UserID " .. uid .. " dihapus dari blacklist", 3)
+                notify("✅ UNBLACKLIST", "UserID " .. uid .. " dihapus (tersimpan)", 3)
                 log("ADMIN", "Blacklist hapus:", uid)
             else
                 notify("⚠️ NOT FOUND", "UserID " .. uid .. " tidak ada di blacklist", 3)
@@ -1911,7 +2125,7 @@ AboutTab:Paragraph({
 
 AboutTab:Paragraph({
     Title = "Kamus Tersedia",
-    Desc  = "1. Kamus Umum Indonesia (default)\n2. Ganas Gahar - withallcombination\n3. Safety Anti Detek - KBBI Final\n4. Kamus Lengkap - dhannhub",
+    Desc  = "1. Kamus Umum Indonesia (default)\n2. Ganas Gahar - withallcombination\n3. Safety Anti Detek - KBBI Final\n4. Kamus Lengkap - sazaraaax",
 })
 
 AboutTab:Paragraph({
@@ -1971,34 +2185,41 @@ log("REMOTE", "Memasang handler remote events...")
 local function onMatchUI(cmd, value)
     log("REMOTE", "MatchUI event | cmd:", tostring(cmd), "| value:", tostring(value))
     if cmd == "ShowMatchUI" then
-        matchActive = true
-        isMyTurn    = false
-        log("MATCH", "Match dimulai")
+        matchActive  = true
+        isMyTurn     = false
+        serverLetter = ""
+        autoRunning  = false
+        blacklistedWords = {}
+        log("MATCH", "Match dimulai — state di-reset")
         resetUsedWords()
         setupSeatMonitoring()
         updateMainStatus()
         updateWordButtons()
     elseif cmd == "HideMatchUI" then
-        matchActive  = false
-        isMyTurn     = false
-        serverLetter = ""
+        matchActive      = false
+        isMyTurn         = false
+        serverLetter     = ""
+        autoRunning      = false
+        blacklistedWords = {}
         log("MATCH", "Match berakhir/disembunyikan")
         resetUsedWords()
         seatStates   = {}
         updateMainStatus()
         updateWordButtons()
     elseif cmd == "StartTurn" then
-        isMyTurn = true
-        log("MATCH", "Giliran SAYA dimulai | serverLetter:", serverLetter, "| auto:", tostring(autoEnabled))
+        isMyTurn         = true
+        lastTurnActivity = tick()
+        -- value bisa berisi serverLetter awal
+        if type(value) == "string" and value ~= "" then
+            serverLetter = value
+        end
+        log("MATCH", "StartTurn | serverLetter:", serverLetter, "| auto:", tostring(autoEnabled))
         if autoEnabled then
             safeSpawn(function()
-                local delay = math.random(300, 500) / 1000
-                log("AI", "Spawn AI dengan delay:", delay, "s")
+                local delay = math.random(200, 400) / 1000
                 task.wait(delay)
                 if matchActive and isMyTurn and autoEnabled then
                     startUltraAI()
-                else
-                    log("AI", "Kondisi tidak valid setelah delay, skip AI")
                 end
             end)
         end
@@ -2014,6 +2235,22 @@ local function onMatchUI(cmd, value)
         log("MATCH", "ServerLetter update →", serverLetter)
         updateMainStatus()
         updateWordButtons()
+        -- kalau giliran kita dan auto nyala tapi AI belum running, trigger
+        if isMyTurn and autoEnabled and not autoRunning and serverLetter ~= "" then
+            safeSpawn(startUltraAI)
+        end
+    elseif cmd == "Mistake" then
+        -- server konfirmasi kata salah (dipake di game sebagai sinyal)
+        if value and type(value) == "table" and value.userId == LocalPlayer.UserId then
+            log("MATCH", "Mistake event untuk player ini")
+            if autoEnabled and matchActive and isMyTurn then
+                safeSpawn(function()
+                    clearToStartWord()
+                    task.wait(0.3)
+                    if matchActive and isMyTurn then startUltraAI() end
+                end)
+            end
+        end
     end
 end
 
@@ -2025,13 +2262,17 @@ local function onBillboard(word)
 end
 
 local function onUsedWarn(word)
-    log("USEDWARN", "UsedWordWarn | word:", tostring(word))
     if word then
-        -- set flag reject — startUltraAI sedang polling ini di task.wait(0.3)
         lastRejectWord = string.lower(tostring(word))
         addUsedWord(word)
-        -- TIDAK panggil startUltraAI lagi di sini
-        -- retry sudah dihandle di dalam loop startUltraAI
+        -- clearToStartWord + retry kalau autoRunning tidak sedang loop
+        if autoEnabled and matchActive and isMyTurn and not autoRunning then
+            safeSpawn(function()
+                clearToStartWord()
+                task.wait(0.3)
+                if matchActive and isMyTurn then startUltraAI() end
+            end)
+        end
     end
 end
 
@@ -2048,6 +2289,8 @@ LeaveTable.OnClientEvent:Connect(function()
     matchActive      = false
     isMyTurn         = false
     serverLetter     = ""
+    autoRunning      = false
+    blacklistedWords = {}
     resetUsedWords()
     seatStates       = {}
     updateMainStatus()
@@ -2056,6 +2299,31 @@ end)
 MatchUI.OnClientEvent:Connect(onMatchUI)
 BillboardUpdate.OnClientEvent:Connect(onBillboard)
 UsedWordWarn.OnClientEvent:Connect(onUsedWarn)
+
+-- PlayerHit: server kasih tau kita kena hit (kata salah dikonfirmasi server)
+if PlayerHit then
+    PlayerHit.OnClientEvent:Connect(function(player)
+        if player == LocalPlayer then
+            log("MATCH", "PlayerHit — kata salah dikonfirmasi server")
+            if autoEnabled and matchActive and isMyTurn then
+                safeSpawn(function()
+                    clearToStartWord()
+                    task.wait(0.4)
+                    if matchActive and isMyTurn then startUltraAI() end
+                end)
+            end
+        end
+    end)
+end
+
+-- PlayerCorrect: kata diterima server (backup konfirmasi)
+if PlayerCorrect then
+    PlayerCorrect.OnClientEvent:Connect(function(player)
+        if player == LocalPlayer then
+            log("MATCH", "PlayerCorrect — kata diterima server ✅")
+        end
+    end)
+end
 
 log("REMOTE", "Semua remote handler terpasang ✅")
 
